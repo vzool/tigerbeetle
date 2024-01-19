@@ -257,6 +257,7 @@ pub fn CompactionType(
             }
 
             pub fn copy(self: *ValueBlockIterator, table_builder: *Table.Builder) void {
+                std.log.info("Merging via ValueBlockIterator.copy()", .{});
                 assert(table_builder.value_count < Table.layout.block_value_count_max);
 
                 const values_in = self.values[self.source_index..];
@@ -364,6 +365,7 @@ pub fn CompactionType(
 
             /// Track our index position.
             current_table_a_value_block_index: usize = 0,
+
             current_table_b_index_block_index: usize = 0,
             current_table_b_value_block_index: usize = 0,
 
@@ -415,7 +417,6 @@ pub fn CompactionType(
             const WriteContext = struct {
                 callback: BlipCallback,
                 ptr: *anyopaque,
-                data_blocks_count: usize = 0,
                 pending_writes: usize = 0,
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
@@ -431,6 +432,11 @@ pub fn CompactionType(
             grid_writes: []Grid.FatWrite,
 
             input_values_processed: u64 = 0,
+
+            // Not sure of a better way.
+            current_split_value_block_a_count: usize = 0,
+            current_split_value_block_b_count: usize = 0,
+            current_split_data_blocks_to_write: ?usize = null,
 
             // Unlike other places where we can use a single state enum, a single Compaction
             // instance is _expected_ to be reading, writing and merging all at once. These
@@ -860,6 +866,7 @@ pub fn CompactionType(
         }
 
         fn blip_read_index(compaction: *Compaction) void {
+            // FIXME: This should only read the index blocks if we need to.
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -962,9 +969,12 @@ pub fn CompactionType(
 
             // Used to select the Grid.Read to use - so shared between table a and table b.
             var read_target: usize = 0;
+            var data_blocks_read_a: usize = 0;
+            var data_blocks_read_b: usize = 0;
 
             // Read data for table a - which we'll only have if we're coming from disk.
             if (bar_context.table_info_a == .disk) {
+                assert(false); // FIXME: Unsupported for now!
                 const index_block = beat_context.blocks.input_index_blocks[0];
                 const index_schema = schema.TableIndex.from(index_block);
 
@@ -974,23 +984,20 @@ pub fn CompactionType(
                 const data_block_addresses = index_schema.data_addresses_used(index_block);
                 const data_block_checksums = index_schema.data_checksums_used(index_block);
 
-                // Issue as many reads as we have space for.
-                var data_blocks_read: usize = 0;
-
-                while (data_blocks_read < beat_context.blocks.input_data_blocks[beat_context.read_current_split][0].len and data_blocks_read < data_blocks_used) {
+                while (data_blocks_read_a < beat_context.blocks.input_data_blocks[beat_context.read_current_split][0].len and data_blocks_read_a < data_blocks_used) {
                     beat_context.grid_reads[read_target].target = compaction;
                     beat_context.grid_reads[read_target].hack = read_target;
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
                         &beat_context.grid_reads[read_target].read,
-                        data_block_addresses[data_blocks_read],
-                        data_block_checksums[data_blocks_read].value,
+                        data_block_addresses[data_blocks_read_a],
+                        data_block_checksums[data_blocks_read_a].value,
                         .{ .cache_read = true, .cache_write = true },
                     );
 
                     read.pending_data_reads += 1;
                     read_target += 1;
-                    data_blocks_read += 1;
+                    data_blocks_read_a += 1;
                 }
             }
 
@@ -1011,31 +1018,31 @@ pub fn CompactionType(
                 const data_block_addresses = index_schema.data_addresses_used(index_block);
                 const data_block_checksums = index_schema.data_checksums_used(index_block);
 
-                // Issue as many reads as we have space for.
-                var data_blocks_read: usize = 0;
-
                 // Try read in as many value blocks as this index block has...
-                while (data_blocks_read < data_blocks_used) {
+                while (data_blocks_read_b < data_blocks_used) {
                     beat_context.grid_reads[read_target].target = compaction;
                     beat_context.grid_reads[read_target].hack = read_target;
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
                         &beat_context.grid_reads[read_target].read,
-                        data_block_addresses[data_blocks_read],
-                        data_block_checksums[data_blocks_read].value,
+                        data_block_addresses[data_blocks_read_b],
+                        data_block_checksums[data_blocks_read_b].value,
                         .{ .cache_read = true, .cache_write = true },
                     );
 
                     read.pending_data_reads += 1;
                     read_target += 1;
-                    data_blocks_read += 1;
+                    data_blocks_read_b += 1;
 
                     // But, once our read buffer is full, break out of the outer loop.
-                    if (data_blocks_read < beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len) {
+                    if (data_blocks_read_b < beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len) {
                         break :outer;
                     }
                 }
             }
+
+            beat_context.current_split_value_block_a_count = data_blocks_read_a;
+            beat_context.current_split_value_block_b_count = data_blocks_read_b;
 
             // Either we have pending data reads, in which case blip_read_next_tick gets called by
             // blip_read_data_callback once all reads are done, or we don't, in which case call it
@@ -1045,24 +1052,31 @@ pub fn CompactionType(
             }
         }
 
-        fn blip_read_data_callback(grid_read: *Grid.Read, block: BlockPtrConst) void {
-            const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", grid_read).target));
+        fn blip_read_data_callback(grid_read: *Grid.Read, value_block: BlockPtrConst) void {
+            const parent = @fieldParentPtr(Grid.FatRead, "read", grid_read);
+            const compaction: *Compaction = @alignCast(@ptrCast(parent.target));
+
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
             const bar_context = &compaction.bar_context.?;
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
-            _ = block;
 
             assert(beat_context.read != null);
             const read = &beat_context.read.?;
 
             read.pending_data_reads -= 1;
+            read.timer_read += 1;
+
             if (read.pending_data_reads != 0) return;
 
-            const d = read.timer.read();
-            std.log.info("Took {} to read all blocks - {}", .{ std.fmt.fmtDuration(d), read.timer_read });
+            // FIXME: Hack, hard code our reads to table b for now.
+            const table_a_or_b = 1;
+            const read_index = parent.hack;
+
+            stdx.copy_disjoint(.exact, u8, beat_context.blocks.input_data_blocks[beat_context.read_current_split][table_a_or_b][read_index], value_block);
+            std.log.info("Copied data block to {}", .{read_index});
 
             // Call the next tick handler directly. We have already been next_tick'd through, so this is safe from stack
             // overflows.
@@ -1076,20 +1090,26 @@ pub fn CompactionType(
             // const compaction = @fieldParentPtr(Compaction, "beat_context", beat_context);
             // _ = compaction;
 
+            const d = read_context.*.?.timer.read();
+            std.log.info("Took {} to read all blocks - {}", .{ std.fmt.fmtDuration(d), read_context.*.?.timer_read });
+
             beat_context.deactivate_and_assert_and_callback(.read, null, null);
         }
 
         fn calculate_values_in(compaction: *Compaction) ValuesIn {
+            assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
+
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
+
+            assert(beat_context.merge != null);
             const cpu = &beat_context.merge.?;
 
             const blocks_a = beat_context.blocks.input_data_blocks[beat_context.merge_current_split][0];
             const blocks_b = beat_context.blocks.input_data_blocks[beat_context.merge_current_split][1];
 
-            // FIXME: TODO handle when we have b tables lol
-            const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b]);
+            const values_b = if (beat_context.current_split_value_block_b_count > 0) Table.data_block_values_used(blocks_b[cpu.current_block_b]) else &.{};
 
             // // Assert that we're reading data blocks in key order.
             // const values_in = compaction.values_in[index];
@@ -1240,7 +1260,8 @@ pub fn CompactionType(
                             // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
                             // FIXME: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
                             // FIXME: SUPER NB! We need to tell our write stage how many blocks to write! This is beat context since it crosses stages!
-                            // beat_context.write.data_blocks_count = merge.current_output_data_block;
+                            assert(beat_context.current_split_data_blocks_to_write == null);
+                            beat_context.current_split_data_blocks_to_write = merge.current_output_data_block;
                             break :outer;
                         },
                     }
@@ -1339,10 +1360,13 @@ pub fn CompactionType(
             const bar_context = &compaction.bar_context.?;
             const beat_context = &compaction.beat_context.?;
 
-            assert(beat_context.write != null);
-            const write = &beat_context.write.?;
+            // FIXME: This can actually be null, just unimplemented (see bottom comment).
+            assert(beat_context.current_split_data_blocks_to_write != null);
 
             beat_context.activate_and_assert(.write, callback, ptr);
+
+            assert(beat_context.write != null);
+            const write = &beat_context.write.?;
 
             std.log.info("Current write split: {}", .{beat_context.write_current_split});
 
@@ -1359,7 +1383,7 @@ pub fn CompactionType(
             }
 
             // Write any complete data blocks.
-            for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..write.data_blocks_count]) |*block| {
+            for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..beat_context.current_split_data_blocks_to_write.?]) |*block| {
                 // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
 
                 beat_context.grid_writes[write_index].target = compaction;
@@ -1367,6 +1391,9 @@ pub fn CompactionType(
                 compaction.grid.create_block(blip_write_callback, &beat_context.grid_writes[write_index].write, block);
                 write_index += 1;
             }
+
+            // FIXME: IS this the best place to reset to null?
+            beat_context.current_split_data_blocks_to_write = null;
 
             const d = write.timer.read();
             std.log.info("Took {} to create {} blocks", .{ std.fmt.fmtDuration(d), write_index });
@@ -1545,7 +1572,7 @@ pub fn CompactionType(
         // TODO: Add benchmarks for all of these specifically.
         /// Copy values from table_a to table_b, dropping tombstones as we go.
         fn copy_drop_tombstones(table_builder: *Table.Builder, values_in: *ValuesIn) void {
-            std.log.info("Entering copy_drop_tombstones...", .{});
+            std.log.info("Merging via copy_drop_tombstones()", .{});
             assert(values_in[1].remaining() == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1570,75 +1597,70 @@ pub fn CompactionType(
             // Copy variables back out.
             values_in[0] = values_in_a;
             table_builder.value_count = values_out_index;
-
-            std.log.info("Set table builder value to: {}", .{table_builder.value_count});
         }
 
         fn merge_fn(table_builder: *Table.Builder, values_in: *ValuesIn, drop_tombstones: bool) void {
-            _ = drop_tombstones;
-            _ = values_in;
-            _ = table_builder;
-            assert(false); // Merge todo still
-            //     assert(values_in[0].remaining() > 0);
-            //     assert(values_in[1].remaining() > 0);
-            //     assert(table_builder.value_count < Table.layout.block_value_count_max);
+            std.log.info("Merging via merge_fn()", .{});
+            assert(values_in[0].remaining() > 0);
+            assert(values_in[1].remaining() > 0);
+            assert(table_builder.value_count < Table.layout.block_value_count_max);
 
-            //     // Copy variables locally to ensure a tight loop.
-            //     const values_in_a = values_in[0];
-            //     const values_in_b = values_in[1];
-            //     const values_out = table_builder.data_block_values();
-            //     var values_in_a_index: usize = 0;
-            //     var values_in_b_index: usize = 0;
-            //     var values_out_index = table_builder.value_count;
+            // Copy variables locally to ensure a tight loop.
+            var values_in_a = values_in[0];
+            var values_in_b = values_in[1];
+            const values_out = table_builder.data_block_values();
+            var values_out_index = table_builder.value_count;
 
-            //     // Merge as many values as possible.
-            //     while (values_in_a_index < values_in_a.len and
-            //         values_in_b_index < values_in_b.len and
-            //         values_out_index < values_out.len)
-            //     {
-            //         const value_a = &values_in_a[values_in_a_index];
-            //         const value_b = &values_in_b[values_in_b_index];
-            //         switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
-            //             .lt => {
-            //                 values_in_a_index += 1;
-            //                 if (drop_tombstones and
-            //                     tombstone(value_a))
-            //                 {
-            //                     assert(Table.usage != .secondary_index);
-            //                     continue;
-            //                 }
-            //                 values_out[values_out_index] = value_a.*;
-            //                 values_out_index += 1;
-            //             },
-            //             .gt => {
-            //                 values_in_b_index += 1;
-            //                 values_out[values_out_index] = value_b.*;
-            //                 values_out_index += 1;
-            //             },
-            //             .eq => {
-            //                 values_in_a_index += 1;
-            //                 values_in_b_index += 1;
+            var value_a = values_in_a.next();
+            var value_b = values_in_b.next();
 
-            //                 if (Table.usage == .secondary_index) {
-            //                     // Secondary index optimization --- cancel out put and remove.
-            //                     assert(tombstone(value_a) != tombstone(value_b));
-            //                     continue;
-            //                 } else if (drop_tombstones) {
-            //                     if (tombstone(value_a)) {
-            //                         continue;
-            //                     }
-            //                 }
+            // Merge as many values as possible.
+            while (values_out_index < values_out.len) {
+                if (value_a == null or value_b == null) break;
 
-            //                 values_out[values_out_index] = value_a.*;
-            //                 values_out_index += 1;
-            //             },
-            //         }
-            //     }
+                switch (std.math.order(key_from_value(&value_a.?), key_from_value(&value_b.?))) {
+                    .lt => {
+                        if (drop_tombstones and
+                            tombstone(&value_a.?))
+                        {
+                            assert(Table.usage != .secondary_index);
+                            continue;
+                        }
+                        values_out[values_out_index] = value_a.?;
+                        values_out_index += 1;
 
-            //     // Copy variables back out.
-            //     values_in[0] = values_in_a[values_in_a_index..];
-            //     values_in[1] = values_in_b[values_in_b_index..];
-            //     table_builder.value_count = values_out_index;
+                        value_a = values_in_a.next();
+                    },
+                    .gt => {
+                        values_out[values_out_index] = value_b.?;
+                        values_out_index += 1;
+
+                        value_b = values_in_b.next();
+                    },
+                    .eq => {
+                        if (Table.usage == .secondary_index) {
+                            // Secondary index optimization --- cancel out put and remove.
+                            assert(tombstone(&value_a.?) != tombstone(&value_b.?));
+                            continue;
+                        } else if (drop_tombstones) {
+                            if (tombstone(&value_a.?)) {
+                                continue;
+                            }
+                        }
+
+                        values_out[values_out_index] = value_a.?;
+                        values_out_index += 1;
+
+                        value_a = values_in_a.next();
+                        value_b = values_in_b.next();
+                    },
+                }
+            }
+
+            // Copy variables back out.
+            values_in[0] = values_in_a;
+            values_in[1] = values_in_b;
+            table_builder.value_count = values_out_index;
         }
     };
 }
