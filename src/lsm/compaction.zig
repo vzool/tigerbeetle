@@ -143,7 +143,7 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        pub fn bar_setup_budget(self: *const Self, beat_budget: u64, output_index_blocks: []BlockPtr) void {
+        pub fn bar_setup_budget(self: *const Self, beat_budget: u64, output_index_blocks: [2][]BlockPtr) void {
             return switch (self.dispatcher) {
                 inline else => |compaction_impl| compaction_impl.bar_setup_budget(beat_budget, output_index_blocks),
             };
@@ -369,10 +369,12 @@ pub fn CompactionType(
             current_table_b_index_block_index: usize = 0,
             current_table_b_value_block_index: usize = 0,
 
-            /// At least 1 output index block needs to span beat boundaries, otherwise it wouldn't be
-            /// possible to pace at a more granular level than tables.
-            output_index_blocks: []BlockPtr,
-            current_index_block: usize = 0, // FIXME: assert less than len above in places
+            /// At least 2 output index blocks needs to span beat boundaries, otherwise it wouldn't be
+            /// possible to pace at a more granular level than tables. We need 2 because of our pipeline
+            /// split.
+            output_index_blocks: [2][]BlockPtr,
+            current_output_index_block_split: usize = 0,
+            current_output_index_block: usize = 0, // FIXME: assert less than len above in places
 
             /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
             /// they are applied deterministically relative to other concurrent compactions.
@@ -723,7 +725,7 @@ pub fn CompactionType(
         /// since the forest requires information from that step to calculate how it should split the work, and
         /// if there's move table, output_index_blocks must be len 0.
         // Minimum of 1, max lsm_growth_factor+1 of output_index_blocks.
-        pub fn bar_setup_budget(compaction: *Compaction, beat_budget: u64, output_index_blocks: []BlockPtr) void {
+        pub fn bar_setup_budget(compaction: *Compaction, beat_budget: u64, output_index_blocks: [2][]BlockPtr) void {
             assert(beat_budget <= constants.lsm_batch_multiple);
             assert(compaction.bar_context != null);
             assert(compaction.beat_context == null);
@@ -736,6 +738,9 @@ pub fn CompactionType(
             // This way we self correct our pacing!
             bar_context.per_beat_input_goal = stdx.div_ceil(bar_context.total_value_count, beat_budget);
             bar_context.output_index_blocks = output_index_blocks;
+
+            // FIXME: Not a hard requirement...
+            assert(bar_context.output_index_blocks[0].len == bar_context.output_index_blocks[1].len);
 
             if (bar_context.move_table) {
                 // FIXME: Asserts here
@@ -805,7 +810,7 @@ pub fn CompactionType(
             assert(
                 blocks.input_index_blocks.len + blocks.input_data_blocks[0][0].len + blocks.input_data_blocks[0][1].len + blocks.input_data_blocks[1][0].len + blocks.input_data_blocks[1][1].len <= grid_reads.len,
             );
-            assert(bar_context.output_index_blocks.len + blocks.output_data_blocks[0].len + blocks.output_data_blocks[1].len <= grid_writes.len);
+            assert(bar_context.output_index_blocks[0].len + bar_context.output_index_blocks[1].len + blocks.output_data_blocks[0].len + blocks.output_data_blocks[1].len <= grid_writes.len);
         }
 
         // Our blip pipeline is 3 stages long, and split into Read, Cpu and Write. Within a single compaction,
@@ -916,6 +921,8 @@ pub fn CompactionType(
                 read_target += 1;
             }
 
+            std.log.info("Scheduled {} index reads ", .{read.pending_index_reads});
+
             // Either we have pending index reads, in which case blip_read_data gets called by
             // blip_read_index_callback once all reads are done, or we don't, in which case call it
             // here.
@@ -964,8 +971,6 @@ pub fn CompactionType(
 
             assert(beat_context.read != null);
             const read = &beat_context.read.?;
-
-            read.timer_read += 1;
 
             // Used to select the Grid.Read to use - so shared between table a and table b.
             var read_target: usize = 0;
@@ -1043,6 +1048,8 @@ pub fn CompactionType(
 
             beat_context.current_split_value_block_a_count = data_blocks_read_a;
             beat_context.current_split_value_block_b_count = data_blocks_read_b;
+
+            std.log.info("Scheduled {} data reads ", .{read.pending_data_reads});
 
             // Either we have pending data reads, in which case blip_read_next_tick gets called by
             // blip_read_data_callback once all reads are done, or we don't, in which case call it
@@ -1193,7 +1200,7 @@ pub fn CompactionType(
 
                 // Set the index block if needed.
                 if (bar_context.table_builder.state == .no_blocks) {
-                    bar_context.table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_index_block]);
+                    bar_context.table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_output_index_block_split][bar_context.current_output_index_block]);
                 }
 
                 // Set the data block if needed.
@@ -1333,8 +1340,8 @@ pub fn CompactionType(
                 std.log.info("Finished index block", .{});
 
                 // FIXME: Write pipelining and the bar global index block situation.
-                bar_context.current_index_block += 1;
-                if (bar_context.current_index_block == bar_context.output_index_blocks.len or force_flush.index_block) {
+                bar_context.current_output_index_block += 1;
+                if (bar_context.current_output_index_block == bar_context.output_index_blocks[bar_context.current_output_index_block_split].len or force_flush.index_block) {
                     need_write = true;
                 }
 
@@ -1373,7 +1380,7 @@ pub fn CompactionType(
             var write_index: usize = 0;
 
             // Write any complete index blocks.
-            for (bar_context.output_index_blocks[0..bar_context.current_index_block]) |*block| {
+            for (bar_context.output_index_blocks[bar_context.current_output_index_block_split][0..bar_context.current_output_index_block]) |*block| {
                 // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
 
                 beat_context.grid_writes[write_index].target = compaction;
@@ -1381,6 +1388,10 @@ pub fn CompactionType(
                 compaction.grid.create_block(blip_write_callback, &beat_context.grid_writes[write_index].write, block);
                 write_index += 1;
             }
+
+            // Move our current_output_index_block_split along since it's bar global state, and reset the count.
+            bar_context.current_output_index_block_split = (bar_context.current_output_index_block_split + 1) % 2;
+            bar_context.current_output_index_block = 0;
 
             // Write any complete data blocks.
             for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..beat_context.current_split_data_blocks_to_write.?]) |*block| {
