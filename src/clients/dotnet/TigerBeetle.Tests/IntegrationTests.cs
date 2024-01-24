@@ -920,7 +920,7 @@ public class IntegrationTests
         {
             // Querying transfers where:
             // `debit_account_id=$account1Id
-            // ORDER BY timestamp ASC`.                
+            // ORDER BY timestamp ASC`.
             var filter = new GetAccountTransfers
             {
                 AccountId = accounts[0].Id,
@@ -941,7 +941,7 @@ public class IntegrationTests
         {
             // Querying transfers where:
             // `credit_account_id=$account2Id
-            // ORDER BY timestamp DESC`.            
+            // ORDER BY timestamp DESC`.
             var filter = new GetAccountTransfers
             {
                 AccountId = accounts[1].Id,
@@ -962,7 +962,7 @@ public class IntegrationTests
         {
             // Querying transfers where:
             // `debit_account_id=$account1Id OR credit_account_id=$account1Id
-            // ORDER BY timestamp ASC LIMIT 5`.       
+            // ORDER BY timestamp ASC LIMIT 5`.
             var filter = new GetAccountTransfers
             {
                 AccountId = accounts[0].Id,
@@ -971,7 +971,7 @@ public class IntegrationTests
                 Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits
             };
 
-            // First 5 items:            
+            // First 5 items:
             var account_transfers = client.GetAccountTransfers(filter);
             Assert.IsTrue(account_transfers.Length == 5);
             ulong timestamp = 0;
@@ -1000,7 +1000,7 @@ public class IntegrationTests
         {
             // Querying transfers where:
             // `debit_account_id=$account2Id OR credit_account_id=$account2Id
-            // ORDER BY timestamp DESC LIMIT 5`.       
+            // ORDER BY timestamp DESC LIMIT 5`.
             var filter = new GetAccountTransfers
             {
                 AccountId = accounts[1].Id,
@@ -1009,7 +1009,7 @@ public class IntegrationTests
                 Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits | GetAccountTransfersFlags.Reversed
             };
 
-            // First 5 items:                
+            // First 5 items:
             var account_transfers = client.GetAccountTransfers(filter);
             Assert.IsTrue(account_transfers.Length == 5);
             ulong timestamp = ulong.MaxValue;
@@ -1363,7 +1363,7 @@ internal class TBServer : IDisposable
     private const string TB_FILE = "dotnet-tests.tigerbeetle";
     private const string TB_SERVER = TB_PATH + "/" + TB_EXE;
     private const string FORMAT = $"format --cluster=0 --replica=0 --replica-count=1 ./" + TB_FILE;
-    private const string START = $"start --addresses=0  --cache-grid=512MB ./" + TB_FILE;
+    private const string START = $"start --addresses=0 --cache-grid=512MB ./" + TB_FILE;
 
     private readonly Process process;
 
@@ -1387,39 +1387,11 @@ internal class TBServer : IDisposable
         process = new Process();
         process.StartInfo.FileName = TB_SERVER;
         process.StartInfo.Arguments = START;
-        process.StartInfo.RedirectStandardError = true;
+        process.StartInfo.RedirectStandardInput = true;
+        process.StartInfo.RedirectStandardOutput = true;
         process.Start();
-        if (process.WaitForExit(100)) throw new InvalidOperationException("Tigerbeetle server failed to start");
 
-        var readPortEvent = new AutoResetEvent(false);
-        var addressLogged = "";
-        var stderrLogged = new StringBuilder();
-        process.ErrorDataReceived += (sender, e) =>
-        {
-            var line = e.Data;
-            if (line == null) return;
-            stderrLogged.Append(line);
-            const string listening = "listening on ";
-            var found = line.IndexOf(listening);
-            if (found != -1)
-            {
-                if (addressLogged != "") throw new InvalidOperationException("have already read the port");
-                addressLogged = line.Substring(found + listening.Length).Trim();
-                readPortEvent.Set();
-            }
-        };
-        process.BeginErrorReadLine();
-        readPortEvent.WaitOne(60_000);
-
-        if (addressLogged == "")
-        {
-            process.Kill();
-            process.WaitForExit();
-            throw new InvalidOperationException($"failed to read the port, ExitCode={process.ExitCode} stderr:\n{stderrLogged.ToString()}");
-        }
-
-        process.CancelErrorRead();
-        Address = addressLogged;
+        Address = process.StandardOutput.ReadLine().Trim();
     }
 
     public void Dispose()
