@@ -253,11 +253,12 @@ pub fn CompactionType(
             }
 
             pub fn remaining(self: *const ValueBlockIterator) usize {
+                std.log.info("Len is {} si is {}", .{ self.values.len, self.source_index });
                 return self.values.len - self.source_index;
             }
 
             pub fn copy(self: *ValueBlockIterator, table_builder: *Table.Builder) void {
-                std.log.info("Merging via ValueBlockIterator.copy()", .{});
+                std.log.info("blip_merge: Merging via ValueBlockIterator.copy()", .{});
                 assert(table_builder.value_count < Table.layout.block_value_count_max);
 
                 const values_in = self.values[self.source_index..];
@@ -359,15 +360,21 @@ pub fn CompactionType(
             total_value_count: u64,
             per_beat_input_goal: u64 = 0,
 
-            /// We have to track our input iterator positions across bars - FIXME: explain why
-            current_block_a_idx: usize = 0,
-            current_block_b_idx: usize = 0,
-
-            /// Track our index position.
-            current_table_a_value_block_index: usize = 0,
-
+            // We have to track all of our input positions across bars. This breaks down to:
+            // * The current index block for table b (table a always has 1 at most).
+            // * The current value block position, _within_ that index block, for both tables.
+            // * The current value _within_ that value block, for both tables.
+            //
+            // This allows us to resume reads from the correct place across beats. There's an
+            // additional trick we do when we enter blip_merge():
+            // There's no guarantee that all values will be exhausted, so we move our blocks around
             current_table_b_index_block_index: usize = 0,
+
+            current_table_a_value_block_index: usize = 0,
             current_table_b_value_block_index: usize = 0,
+
+            current_block_a_index: usize = 0,
+            current_block_b_index: usize = 0,
 
             /// At least 2 output index blocks needs to span beat boundaries, otherwise it wouldn't be
             /// possible to pace at a more granular level than tables. We need 2 because of our pipeline
@@ -401,8 +408,10 @@ pub fn CompactionType(
             const ReadContext = struct {
                 callback: BlipCallback,
                 ptr: *anyopaque,
+
                 pending_index_reads: usize = 0,
                 pending_data_reads: usize = 0,
+
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
                 timer_read: usize = 0,
@@ -410,16 +419,26 @@ pub fn CompactionType(
             const MergeContext = struct {
                 callback: BlipCallback,
                 ptr: *anyopaque,
+
+                // These are blip local state. The value of current_output_data_block is copied out
+                // at the end of the merge, so that the upcoming blip_write knows what to write.
+                //
+                // Both current_block_a and current_block_b start from 0, and it's the
+                // responsibility of our read function to shimmy the input buffers so that the
+                // first block in a buffer is where we need to start reading from.
                 current_block_a: usize = 0,
                 current_block_b: usize = 0,
                 current_output_data_block: usize = 0,
+
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
             };
             const WriteContext = struct {
                 callback: BlipCallback,
                 ptr: *anyopaque,
+
                 pending_writes: usize = 0,
+
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
             };
@@ -751,6 +770,8 @@ pub fn CompactionType(
                 assert(bar_context.per_beat_input_goal > 0);
             }
 
+            std.log.info("Set up budget: OI: [0][0]: {*}, [1][0]: {*}", .{ output_index_blocks[0][0], output_index_blocks[1][0] });
+
             // FIXME: Ok, so this gets set once, but we do an extra data block. What we should do is recalculate this dynamically after each beat, to better spread
             // the work out....
             std.log.info("Total: {} per beat goal: {}", .{ bar_context.total_value_count, bar_context.per_beat_input_goal });
@@ -921,7 +942,7 @@ pub fn CompactionType(
                 read_target += 1;
             }
 
-            std.log.info("Scheduled {} index reads ", .{read.pending_index_reads});
+            std.log.info("blip_read({}): Scheduled {} index reads ", .{ beat_context.read_current_split, read.pending_index_reads });
 
             // Either we have pending index reads, in which case blip_read_data gets called by
             // blip_read_index_callback once all reads are done, or we don't, in which case call it
@@ -951,11 +972,11 @@ pub fn CompactionType(
 
             const read_index = parent.hack;
             stdx.copy_disjoint(.exact, u8, beat_context.blocks.input_index_blocks[read_index], index_block);
-            std.log.info("Copied index block to {}", .{read_index});
+            std.log.info("blip_read({}): Copied index block to {}", .{ beat_context.read_current_split, read_index });
 
             // FIXME: Not sure if I like this too much. According to release_table_blocks, it'll only release at the end of the bar, so should be ok?
             // FIXME: It's critical to release blocks, so ensure this is done properly.
-            compaction.release_table_blocks(index_block);
+            // compaction.release_table_blocks(index_block);
 
             if (read.pending_index_reads != 0) return;
 
@@ -1009,6 +1030,8 @@ pub fn CompactionType(
             // Read data for our tables in range b.
             const table_b_count = bar_context.range_b.tables.count();
 
+            // FIXME: bar_context.current_table_b_index_block_index is incremented here, which means if we do a blip_read and then throw it away,
+            // if it crosses tables it'll be a problem...
             var previous_schema: ?schema.TableIndex = null;
             outer: while (bar_context.current_table_b_index_block_index < table_b_count) : (bar_context.current_table_b_index_block_index += 1) {
                 // The 1 + is to skip over the table a index block.
@@ -1040,7 +1063,7 @@ pub fn CompactionType(
                     data_blocks_read_b += 1;
 
                     // But, once our read buffer is full, break out of the outer loop.
-                    if (data_blocks_read_b < beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len) {
+                    if (data_blocks_read_b == beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len) {
                         break :outer;
                     }
                 }
@@ -1049,7 +1072,7 @@ pub fn CompactionType(
             beat_context.current_split_value_block_a_count = data_blocks_read_a;
             beat_context.current_split_value_block_b_count = data_blocks_read_b;
 
-            std.log.info("Scheduled {} data reads ", .{read.pending_data_reads});
+            std.log.info("blip_read({}): Scheduled {} data reads to a buffer {} big.", .{ beat_context.read_current_split, read.pending_data_reads, beat_context.blocks.input_data_blocks[beat_context.read_current_split][1].len });
 
             // Either we have pending data reads, in which case blip_read_next_tick gets called by
             // blip_read_data_callback once all reads are done, or we don't, in which case call it
@@ -1082,8 +1105,8 @@ pub fn CompactionType(
             const table_a_or_b = 1;
             const read_index = parent.hack;
 
+            std.log.info("blip_read({}): copying data block to [{}][{}][{}]", .{ beat_context.read_current_split, beat_context.read_current_split, table_a_or_b, read_index });
             stdx.copy_disjoint(.exact, u8, beat_context.blocks.input_data_blocks[beat_context.read_current_split][table_a_or_b][read_index], value_block);
-            std.log.info("Copied data block to {}", .{read_index});
 
             // Call the next tick handler directly. We have already been next_tick'd through, so this is safe from stack
             // overflows.
@@ -1098,7 +1121,7 @@ pub fn CompactionType(
             // _ = compaction;
 
             const d = read_context.*.?.timer.read();
-            std.log.info("Took {} to read all blocks - {}", .{ std.fmt.fmtDuration(d), read_context.*.?.timer_read });
+            std.log.info("blip_read({}): Took {} to read all blocks - {}", .{ beat_context.read_current_split, std.fmt.fmtDuration(d), read_context.*.?.timer_read });
 
             beat_context.deactivate_and_assert_and_callback(.read, null, null);
         }
@@ -1141,10 +1164,10 @@ pub fn CompactionType(
                 .immutable => {
                     return .{
                         UnifiedIterator{ .dispatcher = .{
-                            .table_memory_iterator = Tree.TableMemory.Iterator.init(bar_context.table_info_a.immutable, bar_context.current_block_a_idx),
+                            .table_memory_iterator = Tree.TableMemory.Iterator.init(bar_context.table_info_a.immutable, bar_context.current_block_a_index),
                         } },
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_idx),
+                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_index),
                         } },
                     };
                 },
@@ -1153,10 +1176,10 @@ pub fn CompactionType(
                     const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a]);
                     return .{
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_a, bar_context.current_block_a_idx),
+                            .value_block_iterator = ValueBlockIterator.init(values_a, bar_context.current_block_a_index),
                         } },
                         UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_idx),
+                            .value_block_iterator = ValueBlockIterator.init(values_b, bar_context.current_block_b_index),
                         } },
                     };
                 },
@@ -1198,26 +1221,27 @@ pub fn CompactionType(
                 var values_in_a_len = values_in[0].remaining();
                 var values_in_b_len = values_in[1].remaining();
 
-                // Set the index block if needed.
-                if (bar_context.table_builder.state == .no_blocks) {
-                    bar_context.table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_output_index_block_split][bar_context.current_output_index_block]);
-                }
-
-                // Set the data block if needed.
-                if (bar_context.table_builder.state == .index_block) {
-                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.merge_current_split][merge.current_output_data_block]);
-                } else {
-                    // FIXME: Figure this out.
-                    assert(i > 0);
-                }
-
-                std.log.info("blip_merge: values_a: {} and values_b: {} current cpu split: {}", .{ values_in_a_len, values_in_b_len, beat_context.merge_current_split });
+                std.log.info("blip_merge({}): values_a: {} and values_b: {}", .{ beat_context.merge_current_split, values_in_a_len, values_in_b_len });
 
                 // We are responsible for not iterating again if all work is done.
                 assert(values_in_a_len > 0 or values_in_b_len > 0);
 
                 // Loop through the CPU work until we have nothing left.
                 while (values_in_a_len > 0 or values_in_b_len > 0) {
+                    // Set the index block if needed.
+                    if (bar_context.table_builder.state == .no_blocks) {
+                        std.log.info("blip_merge({}): Setting index block to [{}][{}].", .{ beat_context.merge_current_split, bar_context.current_output_index_block_split, bar_context.current_output_index_block });
+                        @memset(bar_context.output_index_blocks[bar_context.current_output_index_block_split][bar_context.current_output_index_block], 0);
+                        bar_context.table_builder.set_index_block(bar_context.output_index_blocks[bar_context.current_output_index_block_split][bar_context.current_output_index_block]);
+                    }
+
+                    // Set the data block if needed.
+                    if (bar_context.table_builder.state == .index_block) {
+                        std.log.info("blip_merge({}): Setting data block to [{}][{}].", .{ beat_context.merge_current_split, beat_context.merge_current_split, merge.current_output_data_block });
+                        @memset(beat_context.blocks.output_data_blocks[beat_context.merge_current_split][merge.current_output_data_block], 0);
+                        bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.merge_current_split][merge.current_output_data_block]);
+                    }
+
                     if (values_in_a_len == 0) {
                         values_in[1].copy(&bar_context.table_builder);
                     } else if (values_in_b_len == 0) {
@@ -1234,9 +1258,9 @@ pub fn CompactionType(
                     const values_in_a_len_new = values_in[0].remaining();
                     const values_in_b_len_new = values_in[1].remaining();
 
-                    // Save our iterator position
-                    bar_context.current_block_a_idx = values_in[0].get_source_index();
-                    bar_context.current_block_b_idx = values_in[1].get_source_index();
+                    // Save our iterator position, if they still had any values left.
+                    bar_context.current_block_a_index = if (values_in_a_len_new > 0) values_in[0].get_source_index() else 0;
+                    bar_context.current_block_b_index = if (values_in_b_len_new > 0) values_in[1].get_source_index() else 0;
 
                     beat_context.input_values_processed += (values_in_a_len - values_in_a_len_new) + (values_in_b_len - values_in_b_len_new);
                     values_in_a_len = values_in_a_len_new;
@@ -1251,7 +1275,7 @@ pub fn CompactionType(
                     bar_exhausted = values_in_a_len + values_in_b_len == 0;
                     beat_exhausted = beat_context.input_values_processed > bar_context.per_beat_input_goal;
 
-                    std.log.info("We've done a total of: {} this beat VS target of {} BarE {} BeatE {}", .{ beat_context.input_values_processed, bar_context.per_beat_input_goal, bar_exhausted, beat_exhausted });
+                    std.log.info("blip_merge({}): We've done a total of: {} this beat VS target of {} BarE {} BeatE {}", .{ beat_context.merge_current_split, beat_context.input_values_processed, bar_context.per_beat_input_goal, bar_exhausted, beat_exhausted });
 
                     switch (compaction.check_and_finish_blocks(.{ .index_block = bar_exhausted, .data_block = bar_exhausted })) {
                         .unfinished_data_block => continue,
@@ -1264,23 +1288,22 @@ pub fn CompactionType(
 
                         // If we have to write, we need to break out of the outer loop.
                         .need_write => {
-                            // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
-                            // FIXME: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-                            // FIXME: SUPER NB! We need to tell our write stage how many blocks to write! This is beat context since it crosses stages!
-                            assert(beat_context.current_split_data_blocks_to_write == null);
-                            beat_context.current_split_data_blocks_to_write = merge.current_output_data_block;
                             break :outer;
                         },
                     }
                 }
             }
 
+            // FIXME: SUPER NB! We need to tell our write stage how many blocks to write! This is beat context since it crosses stages!
+            assert(beat_context.current_split_data_blocks_to_write == null);
+            beat_context.current_split_data_blocks_to_write = merge.current_output_data_block;
+
             // FIXME: Check at least one output value.
             // assert(filled <= target.len);
             // if (filled == 0) assert(Table.usage == .secondary_index);
 
             const d = merge.timer.read();
-            std.log.info("Took {} to CPU merge block", .{std.fmt.fmtDuration(d)});
+            std.log.info("blip_merge({}): Took {} to CPU merge block", .{ beat_context.merge_current_split, std.fmt.fmtDuration(d) });
 
             beat_context.deactivate_and_assert_and_callback(.merge, beat_exhausted or bar_exhausted, bar_exhausted);
         }
@@ -1317,7 +1340,7 @@ pub fn CompactionType(
                     .snapshot_min = snapshot_min_for_table_output(bar_context.op_min),
                     .tree_id = compaction.tree_config.id,
                 });
-                std.log.info("Finished data block", .{});
+                std.log.info("blip_merge({}): Finished data block to [{}][{}]", .{ beat_context.merge_current_split, beat_context.merge_current_split, merge.current_output_data_block });
 
                 merge.current_output_data_block += 1;
                 finished_data_block = true;
@@ -1327,6 +1350,7 @@ pub fn CompactionType(
             }
 
             // Flush the index block if needed.
+            const index_block = table_builder.index_block;
             if (table_builder.index_block_full() or
                 // If the input is exhausted then we need to flush all blocks before finishing.
                 (force_flush.index_block and !table_builder.index_block_empty()))
@@ -1337,7 +1361,7 @@ pub fn CompactionType(
                     .snapshot_min = snapshot_min_for_table_output(bar_context.op_min),
                     .tree_id = compaction.tree_config.id,
                 });
-                std.log.info("Finished index block", .{});
+                std.log.info("blip_merge({}): Finished index block to [{}][{}] - {*}", .{ beat_context.merge_current_split, bar_context.current_output_index_block_split, bar_context.current_output_index_block, index_block });
 
                 // FIXME: Write pipelining and the bar global index block situation.
                 bar_context.current_output_index_block += 1;
@@ -1375,13 +1399,13 @@ pub fn CompactionType(
             assert(beat_context.write != null);
             const write = &beat_context.write.?;
 
-            std.log.info("Current write split: {}", .{beat_context.write_current_split});
+            std.log.info("blip_write({}): starting", .{beat_context.write_current_split});
 
             var write_index: usize = 0;
 
             // Write any complete index blocks.
-            for (bar_context.output_index_blocks[bar_context.current_output_index_block_split][0..bar_context.current_output_index_block]) |*block| {
-                // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
+            for (bar_context.output_index_blocks[bar_context.current_output_index_block_split][0..bar_context.current_output_index_block], 0..) |*block, i| {
+                std.log.info("blip_write({}): Issuing an index write for [{}][{}] - {*}", .{ beat_context.write_current_split, bar_context.current_output_index_block_split, i, block.* });
 
                 beat_context.grid_writes[write_index].target = compaction;
                 write.pending_writes += 1;
@@ -1390,12 +1414,15 @@ pub fn CompactionType(
             }
 
             // Move our current_output_index_block_split along since it's bar global state, and reset the count.
-            bar_context.current_output_index_block_split = (bar_context.current_output_index_block_split + 1) % 2;
-            bar_context.current_output_index_block = 0;
+            // IFF we've written any index blocks.
+            if (write_index > 0) {
+                bar_context.current_output_index_block_split = (bar_context.current_output_index_block_split + 1) % 2;
+                bar_context.current_output_index_block = 0;
+            }
 
             // Write any complete data blocks.
-            for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..beat_context.current_split_data_blocks_to_write.?]) |*block| {
-                // std.log.info("Issuing a write for split {} block {}", .{ write_current_split, i });
+            for (beat_context.blocks.output_data_blocks[beat_context.write_current_split][0..beat_context.current_split_data_blocks_to_write.?], 0..) |*block, i| {
+                std.log.info("blip_write({}): Issuing a data write for [{}][{}]", .{ beat_context.write_current_split, beat_context.write_current_split, i });
 
                 beat_context.grid_writes[write_index].target = compaction;
                 write.pending_writes += 1;
@@ -1407,7 +1434,7 @@ pub fn CompactionType(
             beat_context.current_split_data_blocks_to_write = null;
 
             const d = write.timer.read();
-            std.log.info("Took {} to create {} blocks", .{ std.fmt.fmtDuration(d), write_index });
+            std.log.info("blip_write({}): Took {} to create {} blocks", .{ beat_context.write_current_split, std.fmt.fmtDuration(d), write_index });
             write.timer.reset();
 
             // FIXME: From 2023-12-21
@@ -1439,7 +1466,7 @@ pub fn CompactionType(
 
             if (write.pending_writes == 0) {
                 const duration = write.timer.read();
-                std.log.info("all writes done - took {}! callback time!!", .{std.fmt.fmtDuration(duration)});
+                std.log.info("blip_write({}): all writes done - took {}.", .{ beat_context.write_current_split, std.fmt.fmtDuration(duration) });
                 beat_context.deactivate_and_assert_and_callback(.write, null, null);
             }
         }
@@ -1460,7 +1487,7 @@ pub fn CompactionType(
             // assert(compaction.bar_context.?.table_builder.state == .index_block); // Hmmm
 
             if (beat_context.grid_reservation) |grid_reservation| {
-                std.log.info("forfeiting... {}", .{grid_reservation});
+                std.log.info("beat_grid_forfeit: forfeiting... {}", .{grid_reservation});
                 compaction.grid.forfeit(grid_reservation);
                 // We set the whole beat_context to null later.
             } else {
@@ -1477,7 +1504,7 @@ pub fn CompactionType(
 
         /// FIXME: Describe
         pub fn bar_finish(compaction: *Compaction, op: u64, tree: *Tree) void {
-            std.log.info("bar_finish running for compaction: {s} into level: {}", .{ compaction.tree_config.name, compaction.level_b });
+            std.log.info("bar_finish: running for compaction: {s} into level: {}", .{ compaction.tree_config.name, compaction.level_b });
 
             // If we're the compaction for immutable -> level 0, we need to swap our mutable / immutable
             // tables too. This needs to happen at the end of the first ever bar, which would normally
@@ -1583,7 +1610,7 @@ pub fn CompactionType(
         // TODO: Add benchmarks for all of these specifically.
         /// Copy values from table_a to table_b, dropping tombstones as we go.
         fn copy_drop_tombstones(table_builder: *Table.Builder, values_in: *ValuesIn) void {
-            std.log.info("Merging via copy_drop_tombstones()", .{});
+            std.log.info("blip_merge: Merging via copy_drop_tombstones()", .{});
             assert(values_in[1].remaining() == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1611,7 +1638,7 @@ pub fn CompactionType(
         }
 
         fn merge_fn(table_builder: *Table.Builder, values_in: *ValuesIn, drop_tombstones: bool) void {
-            std.log.info("Merging via merge_fn()", .{});
+            std.log.info("blip_merge: Merging via merge_fn()", .{});
             assert(values_in[0].remaining() > 0);
             assert(values_in[1].remaining() > 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);

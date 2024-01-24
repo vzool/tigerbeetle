@@ -276,11 +276,7 @@ pub fn TableType(
             pub fn reset(builder: *Builder) void {
                 assert(builder.state == .no_blocks);
 
-                builder.* = .{
-                    .index_block = undefined,
-                    .data_block = undefined,
-                    .state = .no_blocks,
-                };
+                builder.* = .{};
             }
 
             pub fn data_block_values(builder: *Builder) []Value {
@@ -454,11 +450,7 @@ pub fn TableType(
                 assert(info.snapshot_max == math.maxInt(u64));
 
                 // Reset the builder to its initial state.
-                builder.* = .{
-                    .index_block = undefined,
-                    .data_block = undefined,
-                    .state = .no_blocks,
-                };
+                builder.* = .{};
 
                 return info;
             }

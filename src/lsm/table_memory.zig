@@ -106,7 +106,7 @@ pub fn TableMemoryType(comptime Table: type) type {
             }
 
             pub fn copy(self: *Iterator, table_builder: *Table.Builder) void {
-                std.log.info("Merging via TableMemory.Iterator.copy()", .{});
+                std.log.info("blip_merge: Merging via TableMemory.Iterator.copy()", .{});
                 assert(table_builder.value_count < Table.layout.block_value_count_max);
 
                 const values_out = table_builder.data_block_values();
